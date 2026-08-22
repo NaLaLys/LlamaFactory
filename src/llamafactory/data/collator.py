@@ -295,6 +295,16 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             features["position_ids"] = torch.cat([features["position_ids"], dummy_image_right_padding_mrope], dim=-1)
             features["attention_mask"] = torch.cat([features["attention_mask"], dummy_image_right_padding_attention_mask], dim=-1)
 
+        # Mirror the non-FA2 packing fix (PR #10737) for the packed-mrope path:
+        # `DataCollatorForSeq2Seq(pad_to_multiple_of=...)` pads `input_ids`/`attention_mask`
+        # but not `position_ids`, and the per-subseq merge above stays shorter than `seq_len`.
+        # Right-pad the trailing (masked) positions with 0 so the merged `position_ids` matches
+        # `input_ids` before validating. Works for both 2D and 3D (mrope) position_ids since the
+        # sequence axis is last. Idempotent with the `has_dummy_image` cat above.
+        pad_len = seq_len - features["position_ids"].shape[-1]
+        if pad_len > 0:
+            features["position_ids"] = F.pad(features["position_ids"], (0, pad_len), value=0)
+
         if features["position_ids"].shape != expected_position_ids_shape:
             raise ValueError(
                 "Merged position_ids shape mismatch: "
@@ -497,6 +507,17 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                 self._unpad_packed_features(features)
 
             features["attention_mask"] = None  # let transformers handle causal packed mask.
+        else:
+            # `DataCollatorForSeq2Seq(pad_to_multiple_of=...)` pads `input_ids`/`attention_mask`
+            # but leaves `position_ids` untouched (it is not in `model_input_names`). On the
+            # non-FA2 packing path we do not unpad, so `position_ids` stays shorter than
+            # `input_ids`, which makes cos/sin shorter than query and crashes
+            # `apply_rotary_pos_emb`. Right-pad `position_ids` to the padded length to match.
+            position_ids = features.get("position_ids")
+            if torch.is_tensor(position_ids):
+                pad_len = features["input_ids"].shape[-1] - position_ids.shape[-1]
+                if pad_len > 0:
+                    features["position_ids"] = F.pad(position_ids, (0, pad_len), value=0)
 
         for key, value in features.items():  # cast data dtype for paligemma
             if torch.is_tensor(value) and torch.is_floating_point(value):
