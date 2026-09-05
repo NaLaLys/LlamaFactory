@@ -325,6 +325,16 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if pad_len > 0:
             features["position_ids"] = F.pad(features["position_ids"], (0, pad_len), value=0)
 
+        # Mirror the non-FA2 packing fix (PR #10737) for the packed-mrope path:
+        # `DataCollatorForSeq2Seq(pad_to_multiple_of=...)` pads `input_ids`/`attention_mask`
+        # but not `position_ids`, and the per-subseq merge above stays shorter than `seq_len`.
+        # Right-pad the trailing (masked) positions with 0 so the merged `position_ids` matches
+        # `input_ids` before validating. Works for both 2D and 3D (mrope) position_ids since the
+        # sequence axis is last. Idempotent with the `has_dummy_image` cat above.
+        pad_len = seq_len - features["position_ids"].shape[-1]
+        if pad_len > 0:
+            features["position_ids"] = F.pad(features["position_ids"], (0, pad_len), value=0)
+
         if features["position_ids"].shape != expected_position_ids_shape:
             raise ValueError(
                 "Merged position_ids shape mismatch: "
@@ -619,6 +629,12 @@ class KTODataCollatorWithPadding(MultiModalDataCollatorForSeq2Seq):
         batch["kl_input_ids"] = kl_batch["input_ids"]
         batch["kl_attention_mask"] = kl_batch["attention_mask"]
         batch["kl_labels"] = kl_batch["labels"]
+        # mrope models: parent __call__ computed position_ids/rope_deltas per batch;
+        # the kl sequences differ from the target ones, so carry the kl pair too
+        # (the KTO trainer forwards them per prefix).
+        for key in ("position_ids", "rope_deltas"):
+            if key in kl_batch:
+                batch[f"kl_{key}"] = kl_batch[key]
         if "cross_attention_mask" in kl_batch:  # for mllama inputs
             batch["kl_cross_attention_mask"] = kl_batch["cross_attention_mask"]
 
